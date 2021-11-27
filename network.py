@@ -1,8 +1,11 @@
-from threading import Thread, Lock, Event, main_thread
+from threading import Thread, Lock, Event
+import logging
 
 class Node:
     ids = []
     RTT = 3     # num of seconds till timeout
+    recover_time = 1 # num of seconds to recover
+    auto_recover = True
     def __init__(self, id: str):
         if id in Node.ids:
             raise ValueError(f'id {id} already in use')
@@ -11,19 +14,64 @@ class Node:
         self.id = id    # str
         self.routes = []    # lists of node ids (str)
         self.neighbors = []     # Nodes
+        self.links = []     # links to neighbors
         self.RREQ = False
         self.RREP = False
+        self.RERR = False
+        self.ACK = False
+        self.alive = True
         self.lock = Lock()
         self.timeout = Event()
 
     def __str__(self):
-        return self.id
+        status = str()
+        if self.alive:
+            status = 'live'
+        else:
+            status = 'dead'
+        return f'{self.id}:{status}'
+
+    def __repr__(self):
+        return str(self)
 
     def dsr(self, dest: str, data = 'default data'):
         # if self has route to dest, transmit data
-        for r in self.routes:   # currently explores only first valid route (should explore every possible route)
+        hasroute = False
+        for r in self.routes:
             if dest in r:
-                self.__transmit(r, data)
+                hasroute = True
+                retry = 0
+                while retry < 2:
+                    self.__forward('DATA', r, data=data)
+
+                    # wait for DACK, RERR, or timeout
+                    timer = Thread(target=self.__timer,args=('ACK',),name=f'{self.id}.DACK_timer')
+                    timer.start()
+                    while (not self.ACK) and (not self.RERR) and (not self.timeout.is_set()):
+                        pass
+
+                    # if self received ACK from dest, forward complimentary ACK
+                    if self.ACK:
+                        self.__forward('SACK', r)
+                        return
+
+                    # if self received RERR, reset RERR flag and try again if another route available
+                    elif self.RERR:
+                        self.lock.acquire()
+                        try:
+                            self.RERR = False
+                        finally:
+                            self.lock.release()
+
+                    # else, try once more
+                    else:
+                        retry += 1
+        # if found route but all failed, no other routes available
+        if hasroute:
+            print(f'Node {self.id} unable to forward data to Node {dest}')
+            # prompt user to continue trying to RREQ. default is yes
+            x = input(f'Continue trying? [Y/N]\n')
+            if x == 'N':
                 return
 
         # else, begin RREQ
@@ -38,7 +86,7 @@ class Node:
         self.__forward('RREQ', route, dest=dest)
 
         # wait for RREP or timeout
-        timer = Thread(target=self.__timer,name=f'{self.id}.timer')
+        timer = Thread(target=self.__timer,args=('RREP',),name=f'{self.id}.RREP_timer')
         timer.start()
         while (not self.RREP) and (not self.timeout.is_set()):
             pass
@@ -47,47 +95,125 @@ class Node:
         if self.RREP:
             for r in self.routes:
                 if dest in r:
-                    self.__forward('DATA', r, data=data)
-                    return
+                    retry = 0
+                    while retry < 2:
+                        self.__forward('DATA', r, data=data)
+
+                        # wait for DACK, RERR, or timeout
+                        timer = Thread(target=self.__timer,args=('ACK',),name=f'{self.id}.DACK_timer')
+                        timer.start()
+                        while (not self.ACK) and (not self.RERR) and (not self.timeout.is_set()):
+                            pass
+
+                        # if self received ACK from dest, forward complimentary ACK
+                        if self.ACK:
+                            self.__forward('SACK', r)
+                            return
+
+                        # if self received RERR, reset RERR flag and try again if another route available
+                        elif self.RERR:
+                            self.lock.acquire()
+                            try:
+                                self.RERR = False
+                            finally:
+                                self.lock.release()
+
+                        # else, try once more
+                        else:
+                            retry += 1
+            # no other routes available
+            print(f'Node {self.id} unable to forward data to Node {dest}')
+
         # else, timeout
         else:
-            print(f'{self.id} timeout')
+            print(f'Node {self.id} timed out. Unable to find route to Node {dest}')
+        
+        # prompt user to continue trying. default is yes
+        x = input(f'Continue trying? [Y/N]\n')
+        if x == 'N':
+            return
+        else:
+            self.dsr(dest,data)
 
     def __forward(self, msg: str, route: list, dest = '', data = 'default data'):
         
-        #print(f'{self.id} {msg} {route} {dest}')
+        logging.debug(f'{self.id} {msg} {route} {dest}')
 
         # RREQ: send RREQ to each neighbor
         if msg == 'RREQ':
             for n in self.neighbors:
-                t = Thread(target=n.__rreq, args=(route,dest), name=f'{n.id}.RREQ')
-                t.start()
+                for link in self.links:
+                    # only if link to neighbor and neighbor are alive, forward RREQ
+                    if link == Link(self,n) and link.alive and n.alive:
+                        t = Thread(target=n.__rreq, args=(route,dest), name=f'{n.id}.RREQ')
+                        t.start()
             return
         # RREP: send RREP to prev node in route
         if msg == 'RREP':
             prevnode = route[route.index(self.id) - 1]
             for n in self.neighbors:
                 if n.id == prevnode:
-                    t = Thread(target=n.__rrep,args=(route,),name=f'{n.id}.RREP')
-                    t.start()
-                    return
+                    for link in self.links:
+                        # only if link to n and n are alive, forward RREP
+                        if link == Link(self,n) and link.alive and n.alive:
+                            t = Thread(target=n.__rrep,args=(route,),name=f'{n.id}.RREP')
+                            t.start()
+                            return
+        # RERR: send RERR to prev node in route
+        if msg == 'RERR':
+            prevnode = route[route.index(self.id) - 1]
+            for n in self.neighbors:
+                if n.id == prevnode:
+                    for link in self.links:
+                        # only if link to n and n are alive, forward RERR
+                        if link == Link(self,n) and link.alive and n.alive:
+                            t = Thread(target=n.__rerr, args=(route,data),name=f'{n.id}.RRER')
+                            t.start()
+                            return
         # DATA: send DATA to next node in route
         if msg == 'DATA':
             nextnode = route[route.index(self.id) + 1]
             for n in self.neighbors:
                 if n.id == nextnode:
-                    t = Thread(target=n.__transmit,args=(route,data))
-                    t.start()
-                    return
-        if msg == 'ERR':
-            return
+                    for link in self.links:
+                        if link == Link(self,n):
+                            # forward DATA to n only if link to n and n is alive
+                            if link.alive and n.alive:
+                                t = Thread(target=n.__transmit,args=(route,data))
+                                t.start()
+                            # if link to n is dead, forward RERR and dead link back to src
+                            elif not link.alive:
+                                self.__rerr(route,[self.id,n.id])
+                            # else, n is dead, forward RERR and dead node back to src
+                            else:
+                                self.__rerr(route,[n.id])
+                            return
+        # DACK: send DACK to prev node in route
+        if msg == 'DACK':
+            prevnode = route[route.index(self.id) - 1]
+            for n in self.neighbors:
+                if n.id == prevnode:
+                    for link in self.links:
+                        # only if link to n and n are alive, forward DACK
+                        if link == Link(self,n) and link.alive and n.alive:
+                            t = Thread(target=n.__dack, args=(route,),name=f'{n.id}.DACK')
+                            t.start()
+                            return
+        # SACK: send SACK to next node in route
+        if msg == 'SACK':
+            nextnode = route[route.index(self.id) + 1]
+            for n in self.neighbors:
+                if n.id == nextnode:
+                    for link in self.links:
+                        # only if link to n and n are alive, forward SACK
+                        if link == Link(self,n) and link.alive and n.alive:
+                            t = Thread(target=n.__sack, args=(route,),name=f'{n.id}.SACK')
+                            t.start()
+                            return
         else:
-            print(f'Node {self.id}.forward(): Invalid msg')
+            logging.critical(f'Node {self.id}.forward(): Invalid msg')
     
     def __rreq(self, route: list, dest: str):
-
-        #print(f'__rreq {self.id} {route} {dest}')
-
         # cache route
         self.__cache(route)
         # if self already forwarded RREQ, terminate
@@ -109,9 +235,6 @@ class Node:
             self.__forward('RREQ', route, dest=dest)
     
     def __rrep(self, route: list):
-        
-        #print(f'__rrep {self.id} {route}')
-        
         # cache route
         self.__cache(route)
         # if self already received RREP, terminate
@@ -160,52 +283,162 @@ class Node:
         #print(f'__cache {self.id} {self.routes}')
 
     def __transmit(self, route: list, data):
-        # if self is dest, transmit success
+        # if self is dest, transmit success, forward ACK to src
         if self.id == route[len(route) - 1]:
-            print(f'{self.id} (DATA): {data}')
+            self.__forward('DACK',route)
+            # wait for SACK or timeout before dislaying data
+            timer = Thread(target=self.__timer,args=('ACK',),name=f'{self.id}.SACK_timer')
+            timer.start()
+            while (not self.ACK) and (not self.timeout.is_set()):
+                pass
+            logging.debug(f'{self.id} received data: {data}')
+            print(f'Node {self.id} received data: {data}')
         # else, forward data to next node in route
         else:
             self.__forward('DATA', route, data=data)
 
-    def __timer(self):
+    def __rerr(self, route: list, delroute: list):
+        # delete all routes with dead link/node
+        self.__delete(delroute)
+        # if self is src, trigger src RERR flag and terminate
+        if self.id == route[0]:
+            self.lock.acquire()
+            try:
+                self.RERR = True
+            finally:
+                self.lock.release()
+            return
+        # else, forward RERR backwards on route
+        else:
+            self.__forward('RERR', route, data = delroute)
+    
+    def __delete(self, delroute: list):
+        # if delroute is a node, remove all routes with that node
+        if len(delroute) == 1:
+            for route in self.routes:
+                if delroute[0] in route:
+                    self.lock.acquire()
+                    try:
+                        self.routes.remove(route)
+                    finally:
+                        self.lock.release()
+        # else, delroute is a link, remove all routes with link in forward and reverse
+        else:
+            x, y = delroute
+            for route in self.routes:
+                if x in route and y in route:
+                    if (route.index(x) + 1 == route.index(y)) or (route.index(x) - 1 == route.index(y)):
+                        self.lock.acquire()
+                        try:
+                            self.routes.remove(route)
+                        finally:
+                            self.lock.release()
+
+    def __dack(self, route: list):
+        # if self is src, set ACK flag for src
+        if self.id == route[0]:
+            self.lock.acquire()
+            try:
+                self.ACK = True
+            finally:
+                self.lock.release()
+        # else, forward DACK
+        else:
+            self.__forward('DACK', route)
+    
+    def __sack(self, route: list):
+        # if self is dest, set ACK flag for src
+        if self.id == route[len(route) - 1]:
+            self.lock.acquire()
+            try:
+                self.ACK = True
+            finally:
+                self.lock.release()
+        # else, forward SACK
+        else:
+            self.__forward('SACK', route)
+
+    def __timer(self, msg: str):
         timeremaining = Node.RTT
         i = 0.1 # seconds
-        # while there is time remaining, check if self received RREP then stop timer
+        # while there is time remaining, check if self received RREP/ACK then stop timer
         # otherwise, wait for i sec then decrement time remaining by i
         while timeremaining > 0:
-            if self.RREP:
+            if (msg == 'RREP' and self.RREP) or (msg == 'ACK' and (self.ACK or self.RERR)):
                 return
             self.timeout.wait(i)
             timeremaining -= i
         # trigger timeout
         self.timeout.set()
             
+class Link:
+    auto_recover = True
+    recover_time = 1 # num of seconds to recover
+    def __init__(self, u: Node, v: Node):
+        if u == v:
+            raise ValueError('attempt to link node to self')
+        self.node1 = u.id
+        self.node2 = v.id
+        self.alive = True
+        self.lock = Lock()
+    
+    def __eq__(self, other):
+        if isinstance(other,Link):
+            return (self.node1 == other.node1 and self.node2 == other.node2) or (self.node1 == other.node2 and self.node2 == other.node1)
+        else:
+            raise TypeError('expecting Link')
+    
+    def __str__(self):
+        status = str()
+        if self.alive:
+            status = 'live'
+        else:
+            status = 'dead'
+        return f'{self.node1}-{self.node2}:{status}'
 
-def linkNodes(u: Node, v: Node):
+    def __repr__(self):
+        return str(self)
+
+def linkNodes(u: Node, v: Node) -> Link:
+    if u == v:
+        raise ValueError('Attempt to link node to self')
     if v not in u.neighbors and u not in v.neighbors:
         u.neighbors.append(v)
         v.neighbors.append(u)
+        link = Link(u,v)
+        u.links.append(link)
+        v.links.append(link)
+        return link
     else:
-        print('already linked')
+        logging.warning(f'Nodes {u} and {v} already linked')
 
+def crash(u):
+    if (isinstance(u, Node) or isinstance(u, Link)):
+        if u.alive:
+            u.lock.acquire()
+            try:
+                u.alive = False
+            finally:
+                u.lock.release()
+            if u.auto_recover:
+                t = Thread(target=recover,args=(u,))
+                t.start()
+        else:
+            print(f'Node {u} already crashed')
+    else:
+        raise TypeError('Expecting Node or Link')
 
-x = Node('x')
-y = Node('y')
-linkNodes(x,y)
-z = Node('z')
-linkNodes(y,z)
-run = Thread(target=x.dsr,args=('z','data goes here'))
-run.start()
-run.join()
-#print(x.routes)
-#print(y.routes)
-#print(z.routes)
-
-###print(f'Routes: {y.routes}')
-'''
-print(threading.enumerate())
-mainthread = threading.main_thread()
-for t in threading.enumerate():
-    if t is not mainthread:
-        print(t.getName())
-'''
+def recover(u):
+    if (isinstance(u, Node) or isinstance(u, Link)):
+        if not u.alive:
+            timer = Event()
+            timer.wait(u.recover_time)
+            u.lock.acquire()
+            try:
+                u.alive = True
+            finally:
+                u.lock.release()
+        else:
+            print(f'Node {u} already live')
+    else:
+        raise TypeError('Expecting Node or Link')
