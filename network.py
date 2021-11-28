@@ -6,6 +6,7 @@ class Node:
     RTT = 3     # num of seconds till timeout
     recover_time = 1 # num of seconds to recover
     auto_recover = True
+    error_count = 0
     def __init__(self, id: str):
         if id in Node.ids:
             raise ValueError(f'id {id} already in use')
@@ -183,9 +184,11 @@ class Node:
                                 t.start()
                             # if link to n is dead, forward RERR and dead link back to src
                             elif not link.alive:
+                                self.error_count += 1
                                 self.__rerr(route,[self.id,n.id])
                             # else, n is dead, forward RERR and dead node back to src
                             else:
+                                self.error_count += 1
                                 self.__rerr(route,[n.id])
                             return
         # DACK: send DACK to prev node in route
