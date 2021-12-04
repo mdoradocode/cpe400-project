@@ -1,5 +1,6 @@
 from threading import Thread, Lock, Event
 import logging
+import time
 
 class Node:
     ids = []
@@ -76,6 +77,8 @@ class Node:
             print(f'Node {self.id} unable to forward data to Node {dest}')
             # prompt user to continue trying to RREQ. default is yes
             x = input(f'Continue trying? [Y/N]\n')
+            #if x == 'Y':
+                #time.sleep(.1)
             if x == 'N':
                 Node.result = 0
                 return
@@ -140,6 +143,7 @@ class Node:
             Node.result = 0
             return
         else:
+        
             self.resetflags()
             self.dsr(dest,data)
 
