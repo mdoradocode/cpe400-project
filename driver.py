@@ -1,19 +1,21 @@
 from network import Node, Link, linkNodes, Thread, crash
 import logging
 import string
+from time import sleep
 
 logging.basicConfig(level=logging.DEBUG,filename='driver.log',format='%(asctime)s : %(levelname)s : %(message)s')
 
 
 def main():
+    logging.info('INITIALIZATION =============================================')
     '''
     class Node and class Link settings
     '''
     Node.RTT = 3
-    Node.recover_time = 1
+    Node.recover_time = .1
     Node.auto_recover = True
 
-    Link.recover_time = 1
+    Link.recover_time = .1
     Link.auto_recover = True
 
     logging.info(f'<class Node> RTT={Node.RTT} s, recover_time={Node.recover_time} s, auto_recover={Node.auto_recover}')
@@ -40,7 +42,7 @@ def main():
     links.append(linkNodes(nodes[0],nodes[1]))  # link A-B
     links.append(linkNodes(nodes[1],nodes[2]))  # link B-C
     links.append(linkNodes(nodes[0],nodes[3]))  # link A-D
-    links.append(linkNodes(nodes[3],nodes[2]))  # link D-C
+    links.append(linkNodes(nodes[2],nodes[3]))  # link C-D
 
     logging.info(f'Number of links={len(links)}')
     logging.info(f'Links={links}')
@@ -59,6 +61,9 @@ def main():
     '''
     DSR test run
     '''
+    logging.info('TEST START =================================================')
+    logging.info(f'Nodes={nodes}')
+    logging.info(f'Links={links}')
     src = nodes[0]      # src is Node A
     dest_id = nodes[2].id  # dest is Node C
     data = 'data goes here'
@@ -66,6 +71,18 @@ def main():
     run = Thread(target=src.dsr,args=(dest_id,data))
     run.start()
     run.join()  # waits for 'run' thread to finish
-
+    sleep(1)    
+    for n in nodes:
+        n.resetflags()
+    logging.info(f'Nodes={nodes}')
+    logging.info(f'Links={links}')    
+    src = nodes[1]      # src is node B
+    dest_id = nodes[3].id  # dest is Node D
+    data = 'data goes here'
+    print(f'Node {src.id} sending data to Node {dest_id}')
+    run1 = Thread(target=src.dsr,args=(dest_id,data))
+    run1.start()
+    run1.join()  # waits for 'run' thread to finish
+    
 if __name__ == '__main__':
     main()
